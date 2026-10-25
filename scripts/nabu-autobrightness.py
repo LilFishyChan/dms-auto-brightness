@@ -837,11 +837,11 @@ class AutoBrightnessDaemon:
     def _evaluate_brightness(self, force=False):
         if force:
             self.smoothed_lux = self.raw_lux
-        self._start_slew_transition()
+        self._start_slew_transition(force=force)
 
     # 一次调整内部按小步渐变（平滑，不突然跳）；多久才"开始下一次调整"
     # 由 trigger_interval_s 控制，两者是两个概念。
-    SLEW_TICK_MS = 800
+    SLEW_TICK_MS = 200
     DEFAULT_USER_GRACE_S = 10
     DEFAULT_TRIGGER_INTERVAL_S = 5
     DEFAULT_LUX_DEADBAND_PCT = 5
@@ -854,8 +854,8 @@ class AutoBrightnessDaemon:
     MIN_BRIGHTNESS_DELTA = 800
     # 单次调整的幅度上限。常规调整小步走；明显的光照突变（开灯/关灯）
     # 走快速通道，一次性挪到位。上限本身是为了压制正反馈引起的来回摆。
-    MAX_STEP_PER_ADJUST = 600
-    MAX_STEP_ON_BIG_CHANGE = 1500
+    MAX_STEP_PER_ADJUST = 10000
+    MAX_STEP_ON_BIG_CHANGE = 10000
 
     def _log_decision(self, action, avg, target_now, extra=""):
         self.decisions = (self.decisions + [{
@@ -868,11 +868,22 @@ class AutoBrightnessDaemon:
             "extra": extra,
         }])[-12:]
 
-    def _start_slew_transition(self):
+    def _start_slew_transition(self, force=False):
         if self.fader_timer_id is not None:
             return
 
         now = time.time()
+
+        avg = self._avg_lux()
+
+        if force:
+            # 用户主动改了设定（profile 等）：立即生效，不看间隔和死区
+            self._log_decision("adjust_forced", avg, self.current_brightness)
+            self.last_trigger_at = now
+            self.slew_target_lux = avg
+            self.is_fading = True
+            self.fader_timer_id = GLib.timeout_add(self.SLEW_TICK_MS, self._on_fader_tick)
+            return
 
         # 判断是不是"明显的光照突变"（开灯/关灯这种级别）
         big_change = False
@@ -1006,11 +1017,12 @@ class AutoBrightnessDaemon:
 
         # 平滑渐变：每帧走差额的两成，300ms 一帧约 1.5 秒到位
         # 最小步长必须小于收敛阈值（1%），否则每次都跨过目标原地来回跳
+        # 每帧走剩余差额的 55%：200ms 一帧，5 帧（约 1 秒）内基本到位
         if diff > 0:
-            step = min(4000.0, max(100.0, diff * 0.4))
+            step = max(100.0, diff * 0.55)
             self.current_val += step
         else:
-            step = min(3800.0, max(100.0, abs(diff) * 0.4))
+            step = max(100.0, abs(diff) * 0.55)
             self.current_val -= step
 
         val_int = int(round(self.current_val))
