@@ -48,6 +48,15 @@ DEFAULT_CONFIG = {
     "active": True,
     "profile": "standard",
     "user_bias": 0.0,
+    # 两次"开始一次调整"之间的最小间隔（秒）。决定多久才重新评估一次
+    "trigger_interval_s": 5,
+    # 环境光变化小于这个百分比时不动屏幕（默认 10%，设置页 5-20）
+    "lux_deadband_pct": 10,
+    # 用来求平均的光照窗口（秒）：拿最近这段时间的均值做决策，不受瞬时抖动影响
+    "lux_window_s": 5,
+    # 每次用户调整，偏好朝他的选择挪动多少（0-100%）。
+    # 不做一次性覆盖：调一次只学一点，多次同向调整才会真正改变曲线。
+    "learn_rate_pct": 30,
     "smooth_duration": 0.8,
     "deadband_pct": 1.2,
     "notify_on_toggle": True,
@@ -162,6 +171,11 @@ def get_state_path():
     return os.path.join(get_runtime_dir(), f"{APP_NAME}.state")
 
 
+def get_probe_path():
+    """Shell 侧（Daemon.qml）写出的真实亮度探针："<0-100> <unix时间戳>"。"""
+    return os.path.join(get_runtime_dir(), APP_NAME, "brightness.txt")
+
+
 def send_notification(title, message, icon="display-brightness-symbolic"):
     try:
         subprocess.run(
@@ -249,6 +263,11 @@ class BacklightBackend:
         self.backend_type = "unknown"
         self.device = preferred_device        # DMS 设备 id 或 sysfs 路径
         self.max_brightness = 10000
+        self._ro_sysfs_path = None
+        self._ro_sysfs_max = 0
+        self._fast_offset = None
+        self._last_known = None
+        self._last_read_ok = None
         self.session_bus = None
         self.powerdevil_proxy = None
         self._sysfs_path = None
@@ -256,9 +275,13 @@ class BacklightBackend:
 
     # ── 探测 ───────────────────────────────────────────────
     def _init_backend(self):
+        # 无论最终用哪个 backend，都探一条只读 sysfs 通道，用于 10 Hz 检测
+        # "用户是否正在手动拖亮度"（fork 一个 dms 进程太贵，读文件几乎免费）
         if self._try_dms():
+            self._probe_sysfs_readonly()
             return
         if self._try_powerdevil():
+            self._probe_sysfs_readonly()
             return
         if self._try_sysfs():
             return
@@ -334,21 +357,104 @@ class BacklightBackend:
             return True
         return False
 
+    def read_probe_history(self):
+        """读 shell 侧写的亮度历史：[(0..10000 亮度, 时间戳), ...]，旧→新。
+
+        daemon 是 DMS 的子进程，`dms ipc call brightness status` 在这里会超时
+        （读回来的一直是兜底值），所以亮度只能由 shell 侧提供。
+        """
+        out = []
+        try:
+            with open(get_probe_path()) as f:
+                for ln in f.read().strip().splitlines()[-20:]:
+                    parts = ln.split()
+                    if len(parts) >= 2:
+                        out.append((int(float(parts[0])) * 100, float(parts[1])))
+        except Exception:
+            pass
+        return out
+
+    def read_probe(self):
+        """当前亮度（历史里的最后一条）。"""
+        hist = self.read_probe_history()
+        return hist[-1] if hist else (None, None)
+
+    # ── 快通道：只读 sysfs（注意：ktz8866 的 brightness 不是 DMS 的控制点）──
+    def _probe_sysfs_readonly(self):
+        for d in sorted(glob.glob("/sys/class/backlight/*")):
+            bpath = os.path.join(d, "brightness")
+            maxp = os.path.join(d, "max_brightness")
+            if not (os.path.exists(bpath) and os.path.exists(maxp)):
+                continue
+            try:
+                with open(maxp) as f:
+                    mx = int(f.read().strip())
+            except Exception:
+                continue
+            self._ro_sysfs_path = d
+            self._ro_sysfs_max = mx
+            logging.info(f"Fast brightness polling via {d} (max {mx})")
+            return True
+        return False
+
+    def _read_sysfs_norm(self):
+        if not self._ro_sysfs_path:
+            return None
+        try:
+            with open(os.path.join(self._ro_sysfs_path, "brightness")) as f:
+                raw = int(f.read().strip())
+            return int(round((raw / max(1, self._ro_sysfs_max)) * 10000))
+        except Exception:
+            return None
+
+    def calibrate_fast(self):
+        """把 sysfs 读数对齐到 backend 的归一化刻度，避免常数偏差被误判成用户操作。"""
+        raw = self._read_sysfs_norm()
+        if raw is None:
+            self._fast_offset = None
+            return
+        self._fast_offset = self.get_brightness() - raw
+        logging.info(f"Fast-poll calibration offset: {self._fast_offset:+d}")
+
+    def read_fast(self):
+        """零开销读（只 open/read 一个文件），返回 0..10000；不可用时返回 None。"""
+        raw = self._read_sysfs_norm()
+        if raw is None or self._fast_offset is None:
+            return None
+        return raw + self._fast_offset
+
     # ── 读 ─────────────────────────────────────────────────
     def get_brightness(self):
-        """返回 0..10000 归一化亮度。"""
+        """返回 0..10000 归一化亮度。
+
+        优先读 sysfs：不 fork 进程、不会因为 DMS 忙或 PATH 缺 dms 而拿到假值
+        （曾经在 daemon 里 `dms ipc call brightness status` 失败被静默吞成 5000，
+        整个闭环就建立在错误读数上了）。
+        """
+        probe_val, _ = self.read_probe()
+        if probe_val is not None:
+            self._last_known = probe_val
+            self._last_read_ok = True
+            return probe_val
+
         if self.backend_type.startswith("DMS"):
             try:
                 r = subprocess.run(
                     ["dms", "ipc", "call", "brightness", "status"],
-                    capture_output=True, text=True, timeout=3,
+                    capture_output=True, text=True, timeout=10,
                 )
                 m = re.search(r"Brightness:\s*(\d+)%", r.stdout)
                 if m:
-                    return int(m.group(1)) * 100
+                    self._last_known = int(m.group(1)) * 100
+                    self._last_read_ok = True
+                    return self._last_known
+                self._last_read_ok = False
+                logging.debug(f"DMS brightness status unparsable: {r.stdout!r} / {r.stderr!r}")
             except Exception as e:
+                self._last_read_ok = False
                 logging.debug(f"DMS get brightness error: {e}")
-            return 5000
+            # 读失败沿用上次已知值——返回一个假值会让整个闭环建立在错误读数上
+            return self._last_known if self._last_known is not None else 5000
 
         if self.powerdevil_proxy:
             try:
@@ -437,6 +543,20 @@ class AutoBrightnessDaemon:
         self.fader_timer_id = None
         self.is_fading = False
         self.ignore_brightness_until = 0.0
+        # 用户正在手动调亮度的截止时间；在此之前绝不写亮度
+        self.user_adjust_until = 0.0
+        self.resume_after_adjust_id = None
+        self.USER_ADJUST_GRACE_S = 10.0
+        # 最近 1.5 秒内我们自己写过的值，用来区分"回显"和"用户在拖"
+        self.recent_writes = []
+        # 上次真正调整屏幕时的环境光，用于光照死区
+        self.last_applied_lux = None
+        # 最近 lux_window_s 内的采样，用均值做决策
+        self.lux_samples = []
+        self.last_trigger_at = 0.0
+        # 诊断：让路次数与最近一次让路的现场，写进 state 文件方便排查
+        self.yield_count = 0
+        self.last_yield = None
 
         # IPC Socket
         self.server_sock = None
@@ -447,6 +567,7 @@ class AutoBrightnessDaemon:
 
     def start(self):
         logging.info(f"Starting {APP_NAME} v{VERSION}...")
+        self.backlight.calibrate_fast()
         self._init_system_bus()
         self._init_session_bus()
         self._init_ipc_socket()
@@ -634,26 +755,114 @@ class AutoBrightnessDaemon:
 
     def _on_brightness_changed(self, connection, sender, path, interface, signal_name, parameters, user_data):
         new_val = parameters.unpack()[0]
-        # Ignore echo signals from our own automated transitions or cooldown period
-        if time.time() < self.ignore_brightness_until or self.is_fading:
+
+        # 自己刚写下去的值，回显忽略
+        if time.time() < self.ignore_brightness_until:
             return
 
-        # Real user manual slider adjustment
+        # 和"我们正打算写/刚写的值"差得远 → 这是用户在拖滑块，
+        # 不是我们的 slew 回显。即使是 is_fading 期间也要认出来，
+        # 否则会一边被用户拖、一边被 slew 拉回去（用户说的"抢亮度"）。
+        if abs(new_val - self.current_val) <= 250:
+            return
+
+        self._yield_to_user(new_val)
+
+    # 自己写过什么，保留够长以覆盖整个 slew 过程
+    OWN_WRITE_WINDOW_S = 30.0
+
+    def _note_write(self, val):
+        now = time.time()
+        self.recent_writes.append((now, val))
+        self.recent_writes = [(t, v) for t, v in self.recent_writes
+                              if now - t < self.OWN_WRITE_WINDOW_S]
+
+    def _is_own_write(self, val):
+        now = time.time()
+        return any(abs(val - v) <= 400 and now - t < self.OWN_WRITE_WINDOW_S
+                   for t, v in self.recent_writes)
+
+    def _user_moved_recently(self, window=4.0):
+        """在探针历史里找出"不是我们写的"那条变化，返回它的亮度（没有则 None）。"""
+        now = time.time()
+        for val, ts in reversed(self.backlight.read_probe_history()):
+            if now - ts > window:
+                continue
+            if not self._is_own_write(val):
+                return val
+        return None
+
+    def _yield_to_user(self, val):
+        """用户在手动调亮度：停掉自动调节，让他先调，停手后再接管。"""
+        self.yield_count += 1
+        self.last_yield = {
+            "at": round(time.time(), 1),
+            "val": int(val),
+            "current_val": int(self.current_val),
+            "lux": round(float(self.smoothed_lux or 0.0), 1),
+        }
+        self._stop_fade()
+        self.user_adjust_until = time.time() + self.USER_ADJUST_GRACE_S
+        self._arm_resume_after_adjust()
+
         if self.config.get("active", True):
-            if abs(new_val - self.target_brightness) > 250:
-                diff = new_val - self.base_curve_brightness
-                bias_pct = round(diff / 100.0, 1)
-                bias_pct = max(-35.0, min(35.0, bias_pct))
-                logging.info(f"User manual slider change: {new_val} (bias: {bias_pct:+.1f}%)")
-                self.config.set("user_bias", bias_pct)
-                self.target_brightness = new_val
-                self.current_val = float(new_val)
-                self.current_brightness = new_val
-                self.ignore_brightness_until = time.time() + 1.0
-                self._update_state_file()
+            lux_now = self._avg_lux()
+            # 用户想要的偏移（百分点）：他选的亮度 - 当前曲线给的值
+            curve_now = calculate_profile_brightness_pct(
+                lux_now, self.config.get("profile", "standard"), bias=0.0)
+            desired = max(-35.0, min(35.0, val / 100.0 - curve_now))
+            learned = float(self.config.get("user_bias", 0.0))
+            rate = max(0.0, min(1.0, float(self.config.get("learn_rate_pct", 30)) / 100.0))
+            updated = learned + (desired - learned) * rate
+            self.config.set("user_bias", round(updated, 2))
+            self.last_applied_lux = float(lux_now)
+            logging.info(
+                f"User manual slider change: {val} at {lux_now:.1f} lux "
+                f"(want {desired:+.1f}%, learned {learned:+.1f}% -> {updated:+.1f}%)"
+            )
+
+        self.target_brightness = val
+        self.current_val = float(val)
+        self.current_brightness = val
+        self.ignore_brightness_until = time.time() + 1.0
+        self._update_state_file()
+
+    def _arm_resume_after_adjust(self):
+        """用户停手一段时间后再恢复自动调节。"""
+        if self.resume_after_adjust_id is not None:
+            GLib.source_remove(self.resume_after_adjust_id)
+        self.resume_after_adjust_id = GLib.timeout_add(500, self._resume_after_adjust)
+
+    def _resume_after_adjust(self):
+        if time.time() < self.user_adjust_until:
+            return True                     # 还在调整窗口内，继续等
+        self.resume_after_adjust_id = None
+        # 以用户最终设定的亮度为起点继续收敛
+        self.current_brightness = self.backlight.get_brightness()
+        self.current_val = float(self.current_brightness)
+        self.ignore_brightness_until = time.time() + 0.5
+        logging.info(f"User adjustment finished, resuming auto-brightness at {self.current_brightness}")
+        self._start_slew_transition()
+        return False
+
+    def _push_lux(self, lux):
+        """把采样放进滑动窗口，窗口长度由 lux_window_s 决定。"""
+        now = time.time()
+        window = float(self.config.get("lux_window_s", self.DEFAULT_LUX_WINDOW_S))
+        self.lux_samples.append((now, float(lux)))
+        self.lux_samples = [(t, v) for t, v in self.lux_samples if now - t <= window]
+        if len(self.lux_samples) > 200:
+            self.lux_samples = self.lux_samples[-200:]
+
+    def _avg_lux(self):
+        """最近一个窗口内的平均光照；没有采样就退回瞬时值。"""
+        if not self.lux_samples:
+            return self.raw_lux
+        return sum(v for _, v in self.lux_samples) / len(self.lux_samples)
 
     def _on_ambient_light_update(self, lux, force=False):
         self.raw_lux = max(0.0, float(lux))
+        self._push_lux(self.raw_lux)
         if self.smoothed_lux is None or force:
             self.smoothed_lux = self.raw_lux
         self._start_slew_transition()
@@ -663,13 +872,60 @@ class AutoBrightnessDaemon:
             self.smoothed_lux = self.raw_lux
         self._start_slew_transition()
 
+    # 一次调整内部按小步渐变（平滑，不突然跳）；多久才"开始下一次调整"
+    # 由 trigger_interval_s 控制，两者是两个概念。
+    SLEW_TICK_MS = 300
+    DEFAULT_TRIGGER_INTERVAL_S = 5
+    DEFAULT_LUX_DEADBAND_PCT = 10
+    DEFAULT_LUX_WINDOW_S = 5
+    # 差距小于这个（2%）就不要再微调了，直接落到目标
+    SETTLE_THRESHOLD = 150
+
     def _start_slew_transition(self):
-        if self.fader_timer_id is None:
-            self.is_fading = True
-            # 10 Hz -> 100ms interval (DMS IPC 每次 fork 一个进程，不能太密)
-            self.fader_timer_id = GLib.timeout_add(100, self._on_fader_tick)
+        if self.fader_timer_id is not None:
+            return
+
+        now = time.time()
+
+        # 两次调整之间至少隔 trigger_interval_s，别一有抖动就动屏幕
+        trigger_s = float(self.config.get("trigger_interval_s", self.DEFAULT_TRIGGER_INTERVAL_S))
+        if self.last_trigger_at and now - self.last_trigger_at < trigger_s:
+            return
+
+        # 光照死区：拿"窗口均值"比，避免瞬时抖动触发
+        avg = self._avg_lux()
+        deadband = float(self.config.get("lux_deadband_pct", self.DEFAULT_LUX_DEADBAND_PCT)) / 100.0
+        if deadband > 0 and self.last_applied_lux is not None and self.last_applied_lux > 0.5:
+            ratio = abs(avg - self.last_applied_lux) / max(1.0, self.last_applied_lux)
+            if ratio < deadband:
+                logging.debug(
+                    f"Lux deadband: {self.last_applied_lux:.1f} -> {avg:.1f} "
+                    f"({ratio * 100:.0f}% < {deadband * 100:.0f}%), keep {self.current_brightness}"
+                )
+                return
+
+        self.last_trigger_at = now
+        self.is_fading = True
+        self.fader_timer_id = GLib.timeout_add(self.SLEW_TICK_MS, self._on_fader_tick)
 
     def _on_fader_tick(self):
+        # 每帧把最新的瞬时值也计入窗口，窗口自然滑动
+        self._push_lux(self.raw_lux)
+        # 用户正在调亮度：一帧都不要写
+        if time.time() < self.user_adjust_until:
+            self.is_fading = False
+            self.fader_timer_id = None
+            return False
+
+        # 发现"用户正在拖"：在 shell 侧记录的亮度历史里，找一条不是我们写的值。
+        # 不能只比"当前值"——daemon 写完探针就变成自己的值了，永远比不出来。
+        moved = self._user_moved_recently(30.0)
+        if moved is not None and abs(moved - self.current_val) > 200:
+            self._yield_to_user(moved)
+            self.is_fading = False
+            self.fader_timer_id = None
+            return False
+
         if not self.config.get("active", True) or self.screen_locked or self.system_suspended:
             self.is_fading = False
             self.fader_timer_id = None
@@ -685,10 +941,14 @@ class AutoBrightnessDaemon:
 
         # 2. Re-calculate target brightness from continuously smoothed lux
         profile_name = self.config.get("profile", "standard")
-        user_bias = float(self.config.get("user_bias", 0.0))
 
-        base_pct = calculate_profile_brightness_pct(self.smoothed_lux, profile_name, bias=0.0)
-        final_pct = calculate_profile_brightness_pct(self.smoothed_lux, profile_name, bias=user_bias)
+        # 用最近窗口的均值，而不是瞬时值
+        avg_lux = self._avg_lux()
+        base_pct = calculate_profile_brightness_pct(avg_lux, profile_name, bias=0.0)
+
+        # 曲线 + 多次学习累积出来的偏好偏移
+        bias = float(self.config.get("user_bias", 0.0))
+        final_pct = max(0.0, min(100.0, base_pct + bias))
 
         self.base_curve_brightness = int(round(base_pct * 100.0))
         self.target_brightness = int(round(final_pct * 100.0))
@@ -697,25 +957,29 @@ class AutoBrightnessDaemon:
         diff = self.target_brightness - self.current_val
         lux_converged = abs(self.raw_lux - self.smoothed_lux) <= 0.05
 
-        if abs(diff) <= 8.0 and lux_converged:
+        if abs(diff) <= self.SETTLE_THRESHOLD and lux_converged:
             self.current_val = float(self.target_brightness)
             self.current_brightness = self.target_brightness
             self.backlight.set_brightness_silent(self.target_brightness)
+            self._note_write(self.target_brightness)
+            self.last_applied_lux = self._avg_lux()
             self.is_fading = False
             self.fader_timer_id = None
             self.ignore_brightness_until = time.time() + 0.5
             self._update_state_file()
             return False
 
+        # 平滑渐变：每帧走差额的两成，300ms 一帧约 1.5 秒到位
         if diff > 0:
-            step = min(160.0, max(14.0, diff * 0.12))
+            step = min(3000.0, max(120.0, diff * 0.2))
             self.current_val += step
         else:
-            step = min(90.0, max(10.0, abs(diff) * 0.08))
+            step = min(2800.0, max(100.0, abs(diff) * 0.2))
             self.current_val -= step
 
         val_int = int(round(self.current_val))
         self.backlight.set_brightness_silent(val_int)
+        self._note_write(val_int)
         self.current_brightness = val_int
         self.ignore_brightness_until = time.time() + 0.5
         self._update_state_file()
@@ -771,11 +1035,18 @@ class AutoBrightnessDaemon:
                 "active": self.config.get("active", True),
                 "profile": self.config.get("profile", "standard"),
                 "user_bias": self.config.get("user_bias", 0.0),
+                "anchor_lux": self.config.get("anchor_lux", None),
+                "anchor_brightness": self.config.get("anchor_brightness", None),
                 "raw_lux": round(self.raw_lux, 1),
                 "smoothed_lux": round(self.smoothed_lux, 1),
                 "current_brightness": self.current_brightness,
                 "target_brightness": self.target_brightness,
                 "backend": self.backlight.backend_type,
+                "fast_read": self.backlight.read_fast(),
+                "user_adjust_until": round(self.user_adjust_until, 2),
+                "trigger_interval_s": self.config.get("trigger_interval_s", self.DEFAULT_TRIGGER_INTERVAL_S),
+                "lux_deadband_pct": self.config.get("lux_deadband_pct", self.DEFAULT_LUX_DEADBAND_PCT),
+                "avg_lux": round(self._avg_lux(), 1),
                 "screen_locked": self.screen_locked,
                 "light_claimed": self.light_claimed,
             }
@@ -845,6 +1116,7 @@ class AutoBrightnessDaemon:
 
         elif cmd == "reset_bias":
             self.config.set("user_bias", 0.0)
+            # 清掉锚点 → 回到纯曲线
             self._evaluate_brightness(force=True)
             self._update_state_file()
             return {"success": True, "user_bias": 0.0}
@@ -866,6 +1138,12 @@ class AutoBrightnessDaemon:
                 "current_brightness": self.current_brightness,
                 "target_brightness": self.target_brightness,
                 "backend": self.backlight.backend_type,
+                "yield_count": self.yield_count,
+                "last_yield": self.last_yield,
+                "last_applied_lux": self.last_applied_lux,
+                "slew_running": self.fader_timer_id is not None,
+                "last_read_ok": self.backlight._last_read_ok,
+                "last_known_brightness": self.backlight._last_known,
             }
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(state, f)

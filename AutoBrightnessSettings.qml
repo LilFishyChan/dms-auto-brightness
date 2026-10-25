@@ -1,6 +1,7 @@
 import QtQuick
 import qs.Common
 import qs.Widgets
+import qs.DCommon.Widgets as DCommon
 import qs.Modules.Plugins
 
 PluginSettings {
@@ -47,6 +48,54 @@ PluginSettings {
     }
 
 
+    // 滑块 + 右侧重置图标；只在值偏离默认值时出现
+    component ResettableSlider: Column {
+        id: rs
+        property string settingKey
+        property string label
+        property string description: ""
+        property int defaultValue: 0
+        property int minimum: 0
+        property int maximum: 100
+        property string unit: ""
+
+        width: parent.width
+        spacing: 0
+
+        SliderSetting {
+            id: slider
+            width: rs.width
+            settingKey: rs.settingKey
+            label: rs.label
+            description: rs.description
+            defaultValue: rs.defaultValue
+            minimum: rs.minimum
+            maximum: rs.maximum
+            unit: rs.unit
+        }
+
+        Item {
+            width: rs.width
+            height: 20
+            visible: slider.value !== rs.defaultValue
+
+            DCommon.DIcon {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                name: "restart_alt"
+                size: 15
+                color: Theme.primary
+
+                MouseArea {
+                    anchors.fill: parent
+                    anchors.margins: -6
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: slider.value = rs.defaultValue
+                }
+            }
+        }
+    }
+
     readonly property var profileOptions: [
         { label: settings.tr("Standard (balanced indoor/outdoor)"), value: "standard" },
         { label: settings.tr("Bright (well-lit rooms)"), value: "bright" },
@@ -80,10 +129,50 @@ PluginSettings {
         options: settings.profileOptions
     }
 
+    // ================= 调节节奏 =================
+    StyledText {
+        width: parent.width
+        text: settings.tr("Adaptation")
+        font.pixelSize: Theme.fontSizeMedium
+        font.bold: true
+        color: Theme.surfaceText
+        topPadding: Theme.spacingM
+    }
+
+    ResettableSlider {
+        settingKey: "trigger_interval_s"
+        label: settings.tr("Update interval")
+        description: settings.tr("Minimum time between brightness changes. Each step is a DMS call, so a short interval makes the screen twitch and fights manual adjustments")
+        defaultValue: 5
+        minimum: 1
+        maximum: 30
+        unit: " s"
+    }
+
+    ResettableSlider {
+        settingKey: "learn_rate_pct"
+        label: settings.tr("Learning rate")
+        description: settings.tr("How far each manual adjustment shifts the learned preference. Low values need several adjustments in the same direction before the curve follows your taste")
+        defaultValue: 30
+        minimum: 5
+        maximum: 100
+        unit: "%"
+    }
+
+    ResettableSlider {
+        settingKey: "lux_deadband_pct"
+        label: settings.tr("Light deadband")
+        description: settings.tr("Skip adjustments when the averaged light changed less than this share")
+        defaultValue: 10
+        minimum: 5
+        maximum: 20
+        unit: "%"
+    }
+
     // ================= 说明 =================
     StyledText {
         width: parent.width
-        text: settings.tr("Dragging the brightness slider makes the daemon remember your preference and keep applying it as an offset (user_bias, range ±35%). To clear the offset, set the brightness where you like it, then turn auto-brightness off and on again.")
+        text: settings.tr("Dragging the brightness slider hands control back to you: auto-adjustment pauses for 3 seconds while you adjust, then takes the value you picked as the new baseline at the current light level and keeps adapting from there. Run nabu-autobrightness --reset-bias to drop the baseline and return to the plain curve.")
         font.pixelSize: Theme.fontSizeSmall
         color: Theme.surfaceVariantText
         wrapMode: Text.WordWrap

@@ -1,16 +1,21 @@
 {
     "Auto Brightness": {
+        "Adaptation": "调节节奏",
         "Auto Brightness": "自动亮度",
-        "On": "已开启",
-        "Off": "已关闭",
-        "Toggle it from the control center. Changes take effect immediately; the backlight backend is auto-detected (DMS IPC → PowerDevil → sysfs).": "在控制中心里开关。改动即时生效，不需要重启。背光后端按 DMS IPC → PowerDevil → sysfs 自动探测。",
+        "Battery saver (capped at 68%)": "省电（上限 68%）",
+        "Bright (well-lit rooms)": "明亮（强光环境）",
         "Brightness curve": "亮度曲线",
         "Curve": "曲线",
-        "Mapping from ambient light to screen brightness; switching profiles recalculates immediately from the current light level": "环境光 → 屏幕亮度的映射曲线；换曲线后立即按当前光强重新计算",
-        "Standard (balanced indoor/outdoor)": "标准（室内外平衡）",
-        "Bright (well-lit rooms)": "明亮（强光环境）",
         "Dim (night reading)": "柔和（夜间阅读）",
-        "Battery saver (capped at 68%)": "省电（上限 68%）",
-        "Dragging the brightness slider makes the daemon remember your preference and keep applying it as an offset (user_bias, range ±35%). To clear the offset, set the brightness where you like it, then turn auto-brightness off and on again.": "手动拖动亮度条时，daemon 会记住你的偏好并作为偏移量持续应用（user_bias，范围 ±35%）。想清掉这个偏移，把亮度手动调到你满意的位置，再把自动亮度关掉重开即可。"
+        "Dragging the brightness slider hands control back to you: auto-adjustment pauses for 3 seconds while you adjust, then takes the value you picked as the new baseline at the current light level and keeps adapting from there. Run nabu-autobrightness --reset-bias to drop the baseline and return to the plain curve.": "拖动亮度滑块时会把控制权交还给你：调整期间自动调节暂停 3 秒，之后会把你这次的选择当成一次学习——每次只朝它挪一点，多调几次才逐渐贴近你的习惯。执行 nabu-autobrightness --reset-bias 可清零学到的偏好、回到原始曲线。",
+        "How far each manual adjustment shifts the learned preference. Low values need several adjustments in the same direction before the curve follows your taste": "每次手动调整会把学到的偏好挪动多少。数值小的时候需要往同一方向多调几次，曲线才会跟上你的口味",
+        "Learning rate": "学习速度",
+        "Light deadband": "光照死区",
+        "Mapping from ambient light to screen brightness; switching profiles recalculates immediately from the current light level": "环境光 → 屏幕亮度的映射曲线；换曲线后立即按当前光强重新计算",
+        "Minimum time between brightness changes. Each step is a DMS call, so a short interval makes the screen twitch and fights manual adjustments": "两次亮度调整之间的最短时间。每次调整都是一次 DMS 调用，间隔太短会让屏幕抖动，也会和手动调整打架",
+        "Skip adjustments when the averaged light changed less than this share": "当（平均后的）光照变化小于该比例时，不做调整",
+        "Standard (balanced indoor/outdoor)": "标准（室内外平衡）",
+        "Toggle it from the control center. Changes take effect immediately; the backlight backend is auto-detected (DMS IPC → PowerDevil → sysfs).": "在控制中心里开关。改动即时生效，不需要重启。背光后端按 DMS IPC → PowerDevil → sysfs 自动探测。",
+        "Update interval": "更新间隔"
     }
 }
