@@ -11,6 +11,42 @@ PluginSettings {
         return I18n.trFor("nabuAutoBrightness", term);
     }
 
+    // ---- 启动阶段的写入守卫 ----
+    // DMS 会在插件数据从磁盘加载之前就预创建设置页；此时每个 Setting 的
+    // loadValue() 只能拿到 defaultValue，而 onValueChanged 会立刻把这个默认值
+    // 保存回去，把磁盘上的真实设置冲掉（症状：重启 DMS 后设置全变回默认）。
+    // 所以在数据就绪之前一律拦住写入，就绪后再统一重读一遍。
+    property bool savingEnabled: false
+
+    function saveValue(key, value) {
+        if (!settings.savingEnabled)
+            return
+        if (pluginService && pluginService.savePluginData) {
+            pluginService.savePluginData(pluginId, key, value)
+            settingChanged()
+        }
+    }
+
+    Timer {
+        interval: 1200
+        running: true
+        repeat: false
+        onTriggered: {
+            // 此刻数据已就绪，先把所有控件重读成真实值
+            const stack = [settings]
+            while (stack.length > 0) {
+                const item = stack.pop()
+                if (typeof item.loadValue === "function")
+                    item.loadValue()
+                for (let i = 0; i < item.children.length; i++)
+                    stack.push(item.children[i])
+            }
+            // 之后才允许写入
+            settings.savingEnabled = true
+        }
+    }
+
+
     readonly property var profileOptions: [
         { label: settings.tr("Standard (balanced indoor/outdoor)"), value: "standard" },
         { label: settings.tr("Bright (well-lit rooms)"), value: "bright" },
