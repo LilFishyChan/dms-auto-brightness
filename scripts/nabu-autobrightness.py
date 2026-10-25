@@ -903,7 +903,7 @@ class AutoBrightnessDaemon:
     DEFAULT_LUX_DEADBAND_PCT = 10
     DEFAULT_LUX_WINDOW_S = 5
     # 差距小于这个（2%）就不要再微调了，直接落到目标
-    SETTLE_THRESHOLD = 200
+    SETTLE_THRESHOLD = 100
     # 目标亮度和当前亮度差不到这个（3%）就根本不启动调整。
     # 室内环境光天然在 ±10% 抖，过了 lux 死区但换算到亮度只差 1-2%，
     # 每次挪一点就是用户看到的"左右跳"。
@@ -958,9 +958,10 @@ class AutoBrightnessDaemon:
         # 正反馈交给下面两道闸挡住——死区（小幅不动）和单次幅度上限（大步分几次走）。
         profile_now = self.config.get("profile", "standard")
         bias_now = float(self.config.get("user_bias", 0.0))
-        target_now = int(round(
-            calculate_profile_brightness_pct(avg, profile_now, bias=bias_now) * 100.0))
-        target_now = max(100, min(10000, target_now))
+        # 目标直接量化到整数百分比：DMS 只能写整 %，目标落在 24.5% 这种位置时
+        # 会在 24 和 25 之间来回跳（用户看到的"最后抖几下"）
+        pct_target = int(round(calculate_profile_brightness_pct(avg, profile_now, bias=bias_now)))
+        target_now = max(1, min(100, pct_target)) * 100
         # 滞回：朝同一方向的调整，差 5% 就够；反向回头要求更大（1.5×），
         # 否则噪声在阈值附近来回穿，屏幕就会左右跳
         delta = target_now - self.current_brightness
