@@ -907,10 +907,11 @@ class AutoBrightnessDaemon:
     # 目标亮度和当前亮度差不到这个（3%）就根本不启动调整。
     # 室内环境光天然在 ±10% 抖，过了 lux 死区但换算到亮度只差 1-2%，
     # 每次挪一点就是用户看到的"左右跳"。
-    MIN_BRIGHTNESS_DELTA = 500
-    # 单次调整最多挪这么多（6%）：屏幕变亮会让环境光传感器读到更多光，
-    # 不限制幅度就会形成"越亮越亮"的正反馈来回摆
+    MIN_BRIGHTNESS_DELTA = 800
+    # 单次调整的幅度上限。常规调整小步走；明显的光照突变（开灯/关灯）
+    # 走快速通道，一次性挪到位。上限本身是为了压制正反馈引起的来回摆。
     MAX_STEP_PER_ADJUST = 600
+    MAX_STEP_ON_BIG_CHANGE = 3000
 
     def _log_decision(self, action, avg, target_now, extra=""):
         self.decisions = (self.decisions + [{
@@ -929,9 +930,14 @@ class AutoBrightnessDaemon:
 
         now = time.time()
 
-        # 两次调整之间至少隔 trigger_interval_s，别一有抖动就动屏幕
+        # 判断是不是"明显的光照突变"（开灯/关灯这种级别）
+        big_change = False
+        if self.last_applied_lux is not None and self.last_applied_lux > 1.0:
+            big_change = (avg > self.last_applied_lux * 2.0) or (avg < self.last_applied_lux * 0.5)
+
+        # 两次常规调整之间至少隔 trigger_interval_s；突变不等
         trigger_s = float(self.config.get("trigger_interval_s", self.DEFAULT_TRIGGER_INTERVAL_S))
-        if self.last_trigger_at and now - self.last_trigger_at < trigger_s:
+        if not big_change and self.last_trigger_at and now - self.last_trigger_at < trigger_s:
             self._log_decision("skip_interval", self._avg_lux(), self.current_brightness)
             return
 
@@ -948,14 +954,12 @@ class AutoBrightnessDaemon:
                 )
                 return
 
-        # 增量式：只看"光照变化让曲线移动了多少"，加到当前亮度上。
-        # 不追绝对曲线——屏幕自己的光会进到传感器里，追绝对值就是正反馈。
+        # 绝对曲线：关灯就一定要变暗，靠"增量"是回不到正确水平的。
+        # 正反馈交给下面两道闸挡住——死区（小幅不动）和单次幅度上限（大步分几次走）。
         profile_now = self.config.get("profile", "standard")
-        ref_lux = self.last_applied_lux if self.last_applied_lux is not None else avg
-        curve_now = calculate_profile_brightness_pct(avg, profile_now, bias=0.0)
-        curve_ref = calculate_profile_brightness_pct(ref_lux, profile_now, bias=0.0)
-        inc = (curve_now - curve_ref) * 100.0
-        target_now = int(round(self.current_brightness + inc))
+        bias_now = float(self.config.get("user_bias", 0.0))
+        target_now = int(round(
+            calculate_profile_brightness_pct(avg, profile_now, bias=bias_now) * 100.0))
         target_now = max(100, min(10000, target_now))
         # 滞回：朝同一方向的调整，差 5% 就够；反向回头要求更大（1.5×），
         # 否则噪声在阈值附近来回穿，屏幕就会左右跳
@@ -971,11 +975,12 @@ class AutoBrightnessDaemon:
             return
         self.last_target_dir = delta
 
-        # 单次只允许朝一个方向挪固定幅度，抑制正反馈
-        target_now = max(self.current_brightness - self.MAX_STEP_PER_ADJUST,
-                         min(self.current_brightness + self.MAX_STEP_PER_ADJUST, target_now))
+        # 单次挪动幅度：常规小步（压正反馈），突变时一次到位
+        cap = self.MAX_STEP_ON_BIG_CHANGE if big_change else self.MAX_STEP_PER_ADJUST
+        target_now = max(self.current_brightness - cap,
+                         min(self.current_brightness + cap, target_now))
 
-        self._log_decision("adjust", avg, target_now)
+        self._log_decision("adjust_big" if big_change else "adjust", avg, target_now)
         self.last_trigger_at = now
         self.slew_target_lux = avg
         self.is_fading = True
