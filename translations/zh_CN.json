@@ -1,0 +1,16 @@
+{
+    "Auto Brightness": {
+        "Auto Brightness": "自动亮度",
+        "On": "已开启",
+        "Off": "已关闭",
+        "Toggle it from the control center. Changes take effect immediately; the backlight backend is auto-detected (DMS IPC → PowerDevil → sysfs).": "在控制中心里开关。改动即时生效，不需要重启。背光后端按 DMS IPC → PowerDevil → sysfs 自动探测。",
+        "Brightness curve": "亮度曲线",
+        "Curve": "曲线",
+        "Mapping from ambient light to screen brightness; switching profiles recalculates immediately from the current light level": "环境光 → 屏幕亮度的映射曲线；换曲线后立即按当前光强重新计算",
+        "Standard (balanced indoor/outdoor)": "标准（室内外平衡）",
+        "Bright (well-lit rooms)": "明亮（强光环境）",
+        "Dim (night reading)": "柔和（夜间阅读）",
+        "Battery saver (capped at 68%)": "省电（上限 68%）",
+        "Dragging the brightness slider makes the daemon remember your preference and keep applying it as an offset (user_bias, range ±35%). To clear the offset, set the brightness where you like it, then turn auto-brightness off and on again.": "手动拖动亮度条时，daemon 会记住你的偏好并作为偏移量持续应用（user_bias，范围 ±35%）。想清掉这个偏移，把亮度手动调到你满意的位置，再把自动亮度关掉重开即可。"
+    }
+}

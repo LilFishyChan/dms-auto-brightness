@@ -1,0 +1,23 @@
+{
+  "id": "nabuAutoBrightness",
+  "name": "Auto Brightness",
+  "description": "Ambient-light auto-brightness via DMS IPC / PowerDevil / sysfs",
+  "version": "0.1.0",
+  "author": "LilFishyChan",
+  "icon": "brightness_auto",
+  "type": "composite",
+  "capabilities": [
+    "daemon",
+    "dankbar-widget"
+  ],
+  "components": {
+    "daemon": "./Daemon.qml",
+    "widget": "./AutoBrightness.qml"
+  },
+  "settings": "./AutoBrightnessSettings.qml",
+  "permissions": [
+    "settings_read",
+    "settings_write",
+    "process"
+  ]
+}
