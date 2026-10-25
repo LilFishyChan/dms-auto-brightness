@@ -263,11 +263,7 @@ class BacklightBackend:
         self.backend_type = "unknown"
         self.device = preferred_device        # DMS 设备 id 或 sysfs 路径
         self.max_brightness = 10000
-        self._ro_sysfs_path = None
-        self._ro_sysfs_max = 0
-        self._fast_offset = None
         self._last_known = None
-        self._last_read_ok = None
         self.session_bus = None
         self.powerdevil_proxy = None
         self._sysfs_path = None
@@ -275,13 +271,9 @@ class BacklightBackend:
 
     # ── 探测 ───────────────────────────────────────────────
     def _init_backend(self):
-        # 无论最终用哪个 backend，都探一条只读 sysfs 通道，用于 10 Hz 检测
-        # "用户是否正在手动拖亮度"（fork 一个 dms 进程太贵，读文件几乎免费）
         if self._try_dms():
-            self._probe_sysfs_readonly()
             return
         if self._try_powerdevil():
-            self._probe_sysfs_readonly()
             return
         if self._try_sysfs():
             return
@@ -379,62 +371,17 @@ class BacklightBackend:
         hist = self.read_probe_history()
         return hist[-1] if hist else (None, None)
 
-    # ── 快通道：只读 sysfs（注意：ktz8866 的 brightness 不是 DMS 的控制点）──
-    def _probe_sysfs_readonly(self):
-        for d in sorted(glob.glob("/sys/class/backlight/*")):
-            bpath = os.path.join(d, "brightness")
-            maxp = os.path.join(d, "max_brightness")
-            if not (os.path.exists(bpath) and os.path.exists(maxp)):
-                continue
-            try:
-                with open(maxp) as f:
-                    mx = int(f.read().strip())
-            except Exception:
-                continue
-            self._ro_sysfs_path = d
-            self._ro_sysfs_max = mx
-            logging.info(f"Fast brightness polling via {d} (max {mx})")
-            return True
-        return False
-
-    def _read_sysfs_norm(self):
-        if not self._ro_sysfs_path:
-            return None
-        try:
-            with open(os.path.join(self._ro_sysfs_path, "brightness")) as f:
-                raw = int(f.read().strip())
-            return int(round((raw / max(1, self._ro_sysfs_max)) * 10000))
-        except Exception:
-            return None
-
-    def calibrate_fast(self):
-        """把 sysfs 读数对齐到 backend 的归一化刻度，避免常数偏差被误判成用户操作。"""
-        raw = self._read_sysfs_norm()
-        if raw is None:
-            self._fast_offset = None
-            return
-        self._fast_offset = self.get_brightness() - raw
-        logging.info(f"Fast-poll calibration offset: {self._fast_offset:+d}")
-
-    def read_fast(self):
-        """零开销读（只 open/read 一个文件），返回 0..10000；不可用时返回 None。"""
-        raw = self._read_sysfs_norm()
-        if raw is None or self._fast_offset is None:
-            return None
-        return raw + self._fast_offset
-
     # ── 读 ─────────────────────────────────────────────────
     def get_brightness(self):
         """返回 0..10000 归一化亮度。
 
-        优先读 sysfs：不 fork 进程、不会因为 DMS 忙或 PATH 缺 dms 而拿到假值
-        （曾经在 daemon 里 `dms ipc call brightness status` 失败被静默吞成 5000，
-        整个闭环就建立在错误读数上了）。
+        优先读 shell 侧探针：daemon 是 DMS 的子进程，在这里调
+        `dms ipc call brightness status` 会超时并返回兜底值，整个闭环就
+        建立在错误读数上了。
         """
         probe_val, _ = self.read_probe()
         if probe_val is not None:
             self._last_known = probe_val
-            self._last_read_ok = True
             return probe_val
 
         if self.backend_type.startswith("DMS"):
@@ -446,12 +393,9 @@ class BacklightBackend:
                 m = re.search(r"Brightness:\s*(\d+)%", r.stdout)
                 if m:
                     self._last_known = int(m.group(1)) * 100
-                    self._last_read_ok = True
                     return self._last_known
-                self._last_read_ok = False
                 logging.debug(f"DMS brightness status unparsable: {r.stdout!r} / {r.stderr!r}")
             except Exception as e:
-                self._last_read_ok = False
                 logging.debug(f"DMS get brightness error: {e}")
             # 读失败沿用上次已知值——返回一个假值会让整个闭环建立在错误读数上
             return self._last_known if self._last_known is not None else 5000
@@ -526,13 +470,11 @@ class AutoBrightnessDaemon:
 
         self.system_bus = None
         self.sensor_proxy = None
-        self.screensaver_proxy = None
 
         self.raw_lux = 10.0
         self.smoothed_lux = 10.0
         self.current_brightness = self.backlight.get_brightness()
         self.target_brightness = self.current_brightness
-        self.base_curve_brightness = self.current_brightness
 
         self.screen_locked = False
         self.system_suspended = False
@@ -577,7 +519,6 @@ class AutoBrightnessDaemon:
 
     def start(self):
         logging.info(f"Starting {APP_NAME} v{VERSION}...")
-        self.backlight.calibrate_fast()
         self._init_system_bus()
         self._init_session_bus()
         self._init_ipc_socket()
@@ -898,7 +839,7 @@ class AutoBrightnessDaemon:
 
     # 一次调整内部按小步渐变（平滑，不突然跳）；多久才"开始下一次调整"
     # 由 trigger_interval_s 控制，两者是两个概念。
-    SLEW_TICK_MS = 300
+    SLEW_TICK_MS = 800
     DEFAULT_TRIGGER_INTERVAL_S = 10
     DEFAULT_LUX_DEADBAND_PCT = 10
     DEFAULT_LUX_WINDOW_S = 5
@@ -1030,14 +971,17 @@ class AutoBrightnessDaemon:
         bias = float(self.config.get("user_bias", 0.0))
         final_pct = max(0.0, min(100.0, base_pct + bias))
 
-        self.base_curve_brightness = int(round(base_pct * 100.0))
-        self.target_brightness = int(round(final_pct * 100.0))
+        # 目标必须是整数百分比：否则 48.95% 这种值会让它在 48/49 之间来回写
+        self.target_brightness = max(1, min(100, int(round(final_pct)))) * 100
 
         # 3. Slew screen brightness towards target_brightness
         diff = self.target_brightness - self.current_val
         lux_converged = abs(self.raw_lux - self.smoothed_lux) <= 0.05
 
-        if abs(diff) <= self.SETTLE_THRESHOLD and lux_converged:
+        # 只要亮度到位就收敛。之前还要求 lux_converged（平滑光照与瞬时的差
+        # ≤0.05），传感器一直在小幅跳动，这个条件几乎永远不成立，于是 tick
+        # 停不下来、反复写 37/38
+        if abs(diff) <= self.SETTLE_THRESHOLD:
             settle_pct = max(1, min(100, int(round(self.target_brightness / 100.0))))
             self.current_val = float(settle_pct * 100)
             self.current_brightness = settle_pct * 100
@@ -1053,11 +997,12 @@ class AutoBrightnessDaemon:
             return False
 
         # 平滑渐变：每帧走差额的两成，300ms 一帧约 1.5 秒到位
+        # 最小步长必须小于收敛阈值（1%），否则每次都跨过目标原地来回跳
         if diff > 0:
-            step = min(3000.0, max(120.0, diff * 0.2))
+            step = min(4000.0, max(100.0, diff * 0.4))
             self.current_val += step
         else:
-            step = min(2800.0, max(100.0, abs(diff) * 0.2))
+            step = min(3800.0, max(100.0, abs(diff) * 0.4))
             self.current_val -= step
 
         val_int = int(round(self.current_val))
@@ -1135,14 +1080,11 @@ class AutoBrightnessDaemon:
                 "active": self.config.get("active", True),
                 "profile": self.config.get("profile", "standard"),
                 "user_bias": self.config.get("user_bias", 0.0),
-                "anchor_lux": self.config.get("anchor_lux", None),
-                "anchor_brightness": self.config.get("anchor_brightness", None),
                 "raw_lux": round(self.raw_lux, 1),
                 "smoothed_lux": round(self.smoothed_lux, 1),
                 "current_brightness": self.current_brightness,
                 "target_brightness": self.target_brightness,
                 "backend": self.backlight.backend_type,
-                "fast_read": self.backlight.read_fast(),
                 "user_adjust_until": round(self.user_adjust_until, 2),
                 "trigger_interval_s": self.config.get("trigger_interval_s", self.DEFAULT_TRIGGER_INTERVAL_S),
                 "lux_deadband_pct": self.config.get("lux_deadband_pct", self.DEFAULT_LUX_DEADBAND_PCT),
@@ -1243,8 +1185,6 @@ class AutoBrightnessDaemon:
                 "last_yield": self.last_yield,
                 "last_applied_lux": self.last_applied_lux,
                 "slew_running": self.fader_timer_id is not None,
-                "last_read_ok": self.backlight._last_read_ok,
-                "last_known_brightness": self.backlight._last_known,
             }
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(state, f)
