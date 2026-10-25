@@ -49,7 +49,7 @@ DEFAULT_CONFIG = {
     "profile": "standard",
     "user_bias": 0.0,
     # 两次"开始一次调整"之间的最小间隔（秒）。决定多久才重新评估一次
-    "trigger_interval_s": 5,
+    "trigger_interval_s": 10,
     # 环境光变化小于这个百分比时不动屏幕（默认 10%，设置页 5-20）
     "lux_deadband_pct": 10,
     # 用来求平均的光照窗口（秒）：拿最近这段时间的均值做决策，不受瞬时抖动影响
@@ -554,6 +554,16 @@ class AutoBrightnessDaemon:
         # 最近 lux_window_s 内的采样，用均值做决策
         self.lux_samples = []
         self.last_trigger_at = 0.0
+        self.last_target_dir = 0
+        # 上次真正写进 DMS 的整数百分比（DMS 只接受整数）
+        self.last_written_pct = None
+        # 最近若干次"要不要调整"的决策，写进 state 方便排查抖动
+        self.decisions = []
+        # 已经处理过的用户调整时间戳：同一条历史不能反复触发让路
+        self.last_seen_user_ts = 0.0
+        # 本次调整开始时锁定的光照：slew 过程中目标不能跟着窗口漂，
+        # 否则步进方向来回翻转，屏幕会一高一低
+        self.slew_target_lux = None
         # 诊断：让路次数与最近一次让路的现场，写进 state 文件方便排查
         self.yield_count = 0
         self.last_yield = None
@@ -768,8 +778,9 @@ class AutoBrightnessDaemon:
 
         self._yield_to_user(new_val)
 
-    # 自己写过什么，保留够长以覆盖整个 slew 过程
+    # 自己写过什么，保留够长以覆盖整个 slew 过程；容差 1.5%
     OWN_WRITE_WINDOW_S = 30.0
+    OWN_WRITE_TOLERANCE = 150
 
     def _note_write(self, val):
         now = time.time()
@@ -778,17 +789,29 @@ class AutoBrightnessDaemon:
                               if now - t < self.OWN_WRITE_WINDOW_S]
 
     def _is_own_write(self, val):
+        """这个亮度值是不是我们自己写过的。
+
+        容差要小：±4% 时用户拖几格正好落进我们刚写过的值附近，就被判成
+        "自己写的"而忽略掉，结果继续被覆盖（用户看到的左右跳）。
+        """
         now = time.time()
-        return any(abs(val - v) <= 400 and now - t < self.OWN_WRITE_WINDOW_S
+        return any(abs(val - v) <= self.OWN_WRITE_TOLERANCE and now - t < self.OWN_WRITE_WINDOW_S
                    for t, v in self.recent_writes)
 
     def _user_moved_recently(self, window=4.0):
-        """在探针历史里找出"不是我们写的"那条变化，返回它的亮度（没有则 None）。"""
+        """在探针历史里找出**新出现的**、不是我们写的那条变化。
+
+        必须按时间戳去重：否则用户调过一次之后，那条记录会在窗口里反复被
+        认成"又动了"，导致让路—恢复—再让路，屏幕看起来一高一低。
+        """
         now = time.time()
         for val, ts in reversed(self.backlight.read_probe_history()):
             if now - ts > window:
-                continue
+                break
+            if ts <= self.last_seen_user_ts:
+                break
             if not self._is_own_write(val):
+                self.last_seen_user_ts = ts
                 return val
         return None
 
@@ -802,6 +825,7 @@ class AutoBrightnessDaemon:
             "lux": round(float(self.smoothed_lux or 0.0), 1),
         }
         self._stop_fade()
+        self.slew_target_lux = None
         self.user_adjust_until = time.time() + self.USER_ADJUST_GRACE_S
         self._arm_resume_after_adjust()
 
@@ -875,11 +899,29 @@ class AutoBrightnessDaemon:
     # 一次调整内部按小步渐变（平滑，不突然跳）；多久才"开始下一次调整"
     # 由 trigger_interval_s 控制，两者是两个概念。
     SLEW_TICK_MS = 300
-    DEFAULT_TRIGGER_INTERVAL_S = 5
+    DEFAULT_TRIGGER_INTERVAL_S = 10
     DEFAULT_LUX_DEADBAND_PCT = 10
     DEFAULT_LUX_WINDOW_S = 5
     # 差距小于这个（2%）就不要再微调了，直接落到目标
-    SETTLE_THRESHOLD = 150
+    SETTLE_THRESHOLD = 200
+    # 目标亮度和当前亮度差不到这个（3%）就根本不启动调整。
+    # 室内环境光天然在 ±10% 抖，过了 lux 死区但换算到亮度只差 1-2%，
+    # 每次挪一点就是用户看到的"左右跳"。
+    MIN_BRIGHTNESS_DELTA = 500
+    # 单次调整最多挪这么多（6%）：屏幕变亮会让环境光传感器读到更多光，
+    # 不限制幅度就会形成"越亮越亮"的正反馈来回摆
+    MAX_STEP_PER_ADJUST = 600
+
+    def _log_decision(self, action, avg, target_now, extra=""):
+        self.decisions = (self.decisions + [{
+            "at": round(time.time(), 1),
+            "action": action,
+            "avg_lux": round(float(avg), 1),
+            "target": int(target_now),
+            "current": int(self.current_brightness),
+            "delta": int(target_now - self.current_brightness),
+            "extra": extra,
+        }])[-12:]
 
     def _start_slew_transition(self):
         if self.fader_timer_id is not None:
@@ -890,6 +932,7 @@ class AutoBrightnessDaemon:
         # 两次调整之间至少隔 trigger_interval_s，别一有抖动就动屏幕
         trigger_s = float(self.config.get("trigger_interval_s", self.DEFAULT_TRIGGER_INTERVAL_S))
         if self.last_trigger_at and now - self.last_trigger_at < trigger_s:
+            self._log_decision("skip_interval", self._avg_lux(), self.current_brightness)
             return
 
         # 光照死区：拿"窗口均值"比，避免瞬时抖动触发
@@ -898,13 +941,43 @@ class AutoBrightnessDaemon:
         if deadband > 0 and self.last_applied_lux is not None and self.last_applied_lux > 0.5:
             ratio = abs(avg - self.last_applied_lux) / max(1.0, self.last_applied_lux)
             if ratio < deadband:
+                self._log_decision("skip_lux_deadband", avg, self.current_brightness)
                 logging.debug(
                     f"Lux deadband: {self.last_applied_lux:.1f} -> {avg:.1f} "
                     f"({ratio * 100:.0f}% < {deadband * 100:.0f}%), keep {self.current_brightness}"
                 )
                 return
 
+        # 增量式：只看"光照变化让曲线移动了多少"，加到当前亮度上。
+        # 不追绝对曲线——屏幕自己的光会进到传感器里，追绝对值就是正反馈。
+        profile_now = self.config.get("profile", "standard")
+        ref_lux = self.last_applied_lux if self.last_applied_lux is not None else avg
+        curve_now = calculate_profile_brightness_pct(avg, profile_now, bias=0.0)
+        curve_ref = calculate_profile_brightness_pct(ref_lux, profile_now, bias=0.0)
+        inc = (curve_now - curve_ref) * 100.0
+        target_now = int(round(self.current_brightness + inc))
+        target_now = max(100, min(10000, target_now))
+        # 滞回：朝同一方向的调整，差 5% 就够；反向回头要求更大（1.5×），
+        # 否则噪声在阈值附近来回穿，屏幕就会左右跳
+        delta = target_now - self.current_brightness
+        same_dir = (delta > 0) == (self.last_target_dir >= 0)
+        threshold = self.MIN_BRIGHTNESS_DELTA if same_dir else int(self.MIN_BRIGHTNESS_DELTA * 1.5)
+        if abs(delta) < threshold:
+            self._log_decision("skip_brightness_deadband", avg, target_now)
+            logging.debug(
+                f"Brightness delta too small: {self.current_brightness} -> {target_now} "
+                f"({delta:+d}, need {threshold}), skip"
+            )
+            return
+        self.last_target_dir = delta
+
+        # 单次只允许朝一个方向挪固定幅度，抑制正反馈
+        target_now = max(self.current_brightness - self.MAX_STEP_PER_ADJUST,
+                         min(self.current_brightness + self.MAX_STEP_PER_ADJUST, target_now))
+
+        self._log_decision("adjust", avg, target_now)
         self.last_trigger_at = now
+        self.slew_target_lux = avg
         self.is_fading = True
         self.fader_timer_id = GLib.timeout_add(self.SLEW_TICK_MS, self._on_fader_tick)
 
@@ -942,8 +1015,9 @@ class AutoBrightnessDaemon:
         # 2. Re-calculate target brightness from continuously smoothed lux
         profile_name = self.config.get("profile", "standard")
 
-        # 用最近窗口的均值，而不是瞬时值
-        avg_lux = self._avg_lux()
+        # 用本次调整开始时锁定的均值；slew 途中不再重新取平均，
+        # 否则目标会一直漂，步进来回翻就成了"一高一低"
+        avg_lux = self.slew_target_lux if self.slew_target_lux is not None else self._avg_lux()
         base_pct = calculate_profile_brightness_pct(avg_lux, profile_name, bias=0.0)
 
         # 曲线 + 多次学习累积出来的偏好偏移
@@ -958,11 +1032,14 @@ class AutoBrightnessDaemon:
         lux_converged = abs(self.raw_lux - self.smoothed_lux) <= 0.05
 
         if abs(diff) <= self.SETTLE_THRESHOLD and lux_converged:
-            self.current_val = float(self.target_brightness)
-            self.current_brightness = self.target_brightness
-            self.backlight.set_brightness_silent(self.target_brightness)
+            settle_pct = max(1, min(100, int(round(self.target_brightness / 100.0))))
+            self.current_val = float(settle_pct * 100)
+            self.current_brightness = settle_pct * 100
+            self.backlight.set_brightness_silent(settle_pct * 100)
             self._note_write(self.target_brightness)
-            self.last_applied_lux = self._avg_lux()
+            self.last_written_pct = max(1, min(100, int(round(self.target_brightness / 100.0))))
+            self.last_applied_lux = avg_lux
+            self.slew_target_lux = None
             self.is_fading = False
             self.fader_timer_id = None
             self.ignore_brightness_until = time.time() + 0.5
@@ -978,9 +1055,26 @@ class AutoBrightnessDaemon:
             self.current_val -= step
 
         val_int = int(round(self.current_val))
+        pct = max(1, min(100, int(round(val_int / 100.0))))
+        # DMS 只认整数百分比：24.5% 会被写成 24 或 25，来回就是 1% 的抖动。
+        # 同一个百分比不重复写。
+        if pct == self.last_written_pct:
+            # 关键：内部值必须一起对齐到真实写下去的整数百分比，
+            # 否则 current_val 会一直漂，下一帧又算出另一个百分比 → 30↔31↔32 来回抖
+            self.current_val = float(pct * 100)
+            self.current_brightness = pct * 100
+            if abs(self.target_brightness - self.current_brightness) <= self.SETTLE_THRESHOLD:
+                self.is_fading = False
+                self.fader_timer_id = None
+                self.ignore_brightness_until = time.time() + 0.5
+                self.last_applied_lux = self.slew_target_lux
+                self.slew_target_lux = None
+                return False
+            return True
+        self.last_written_pct = pct
         self.backlight.set_brightness_silent(val_int)
-        self._note_write(val_int)
-        self.current_brightness = val_int
+        self._note_write(pct * 100)
+        self.current_brightness = pct * 100
         self.ignore_brightness_until = time.time() + 0.5
         self._update_state_file()
         return True
@@ -1139,6 +1233,7 @@ class AutoBrightnessDaemon:
                 "target_brightness": self.target_brightness,
                 "backend": self.backlight.backend_type,
                 "yield_count": self.yield_count,
+                "decisions": self.decisions,
                 "last_yield": self.last_yield,
                 "last_applied_lux": self.last_applied_lux,
                 "slew_running": self.fader_timer_id is not None,
