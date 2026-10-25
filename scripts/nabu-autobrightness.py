@@ -49,14 +49,16 @@ DEFAULT_CONFIG = {
     "profile": "standard",
     "user_bias": 0.0,
     # 两次"开始一次调整"之间的最小间隔（秒）。决定多久才重新评估一次
-    "trigger_interval_s": 10,
+    "trigger_interval_s": 5,
     # 环境光变化小于这个百分比时不动屏幕（默认 10%，设置页 5-20）
-    "lux_deadband_pct": 10,
+    "lux_deadband_pct": 5,
     # 用来求平均的光照窗口（秒）：拿最近这段时间的均值做决策，不受瞬时抖动影响
     "lux_window_s": 5,
+    # 用户手动调完亮度后，暂停自动调节多久（秒）
+    "user_grace_s": 10,
     # 每次用户调整，偏好朝他的选择挪动多少（0-100%）。
     # 不做一次性覆盖：调一次只学一点，多次同向调整才会真正改变曲线。
-    "learn_rate_pct": 30,
+    "learn_rate_pct": 10,
     "smooth_duration": 0.8,
     "deadband_pct": 1.2,
     "notify_on_toggle": True,
@@ -488,7 +490,6 @@ class AutoBrightnessDaemon:
         # 用户正在手动调亮度的截止时间；在此之前绝不写亮度
         self.user_adjust_until = 0.0
         self.resume_after_adjust_id = None
-        self.USER_ADJUST_GRACE_S = 10.0
         # 最近 1.5 秒内我们自己写过的值，用来区分"回显"和"用户在拖"
         self.recent_writes = []
         # 上次真正调整屏幕时的环境光，用于光照死区
@@ -767,7 +768,8 @@ class AutoBrightnessDaemon:
         }
         self._stop_fade()
         self.slew_target_lux = None
-        self.user_adjust_until = time.time() + self.USER_ADJUST_GRACE_S
+        grace = float(self.config.get("user_grace_s", self.DEFAULT_USER_GRACE_S))
+        self.user_adjust_until = time.time() + grace
         self._arm_resume_after_adjust()
 
         if self.config.get("active", True):
@@ -840,8 +842,9 @@ class AutoBrightnessDaemon:
     # 一次调整内部按小步渐变（平滑，不突然跳）；多久才"开始下一次调整"
     # 由 trigger_interval_s 控制，两者是两个概念。
     SLEW_TICK_MS = 800
-    DEFAULT_TRIGGER_INTERVAL_S = 10
-    DEFAULT_LUX_DEADBAND_PCT = 10
+    DEFAULT_USER_GRACE_S = 10
+    DEFAULT_TRIGGER_INTERVAL_S = 5
+    DEFAULT_LUX_DEADBAND_PCT = 5
     DEFAULT_LUX_WINDOW_S = 5
     # 差距小于这个（2%）就不要再微调了，直接落到目标
     SETTLE_THRESHOLD = 100
@@ -852,7 +855,7 @@ class AutoBrightnessDaemon:
     # 单次调整的幅度上限。常规调整小步走；明显的光照突变（开灯/关灯）
     # 走快速通道，一次性挪到位。上限本身是为了压制正反馈引起的来回摆。
     MAX_STEP_PER_ADJUST = 600
-    MAX_STEP_ON_BIG_CHANGE = 3000
+    MAX_STEP_ON_BIG_CHANGE = 1500
 
     def _log_decision(self, action, avg, target_now, extra=""):
         self.decisions = (self.decisions + [{
@@ -875,6 +878,11 @@ class AutoBrightnessDaemon:
         big_change = False
         if self.last_applied_lux is not None and self.last_applied_lux > 1.0:
             big_change = (avg > self.last_applied_lux * 2.0) or (avg < self.last_applied_lux * 0.5)
+
+        # 用户刚手动调过亮度：这段时间内不许走快速通道。
+        # 否则他刚设好的值会被一次 15% 的跳跃顶掉（"暗着突然变亮"）。
+        if big_change and time.time() < self.user_adjust_until + grace:
+            big_change = False
 
         # 两次常规调整之间至少隔 trigger_interval_s；突变不等
         trigger_s = float(self.config.get("trigger_interval_s", self.DEFAULT_TRIGGER_INTERVAL_S))
@@ -1087,6 +1095,7 @@ class AutoBrightnessDaemon:
                 "backend": self.backlight.backend_type,
                 "user_adjust_until": round(self.user_adjust_until, 2),
                 "trigger_interval_s": self.config.get("trigger_interval_s", self.DEFAULT_TRIGGER_INTERVAL_S),
+                "user_grace_s": self.config.get("user_grace_s", self.DEFAULT_USER_GRACE_S),
                 "lux_deadband_pct": self.config.get("lux_deadband_pct", self.DEFAULT_LUX_DEADBAND_PCT),
                 "avg_lux": round(self._avg_lux(), 1),
                 "screen_locked": self.screen_locked,

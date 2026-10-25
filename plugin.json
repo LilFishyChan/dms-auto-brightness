@@ -2,7 +2,7 @@
     "id": "nabuAutoBrightness",
     "name": "Auto Brightness",
     "description": "Ambient-light auto-brightness via DMS IPC / PowerDevil / sysfs",
-    "version": "0.1.6",
+    "version": "0.1.7",
     "author": "LilFishyChan",
     "icon": "brightness_auto",
     "type": "composite",

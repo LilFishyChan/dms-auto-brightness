@@ -150,10 +150,20 @@ PluginSettings {
     }
 
     ResettableSlider {
+        settingKey: "user_grace_s"
+        label: settings.tr("Pause after manual change")
+        description: settings.tr("How long auto-adjustment leaves the screen alone after you set the brightness yourself")
+        defaultValue: 10
+        minimum: 5
+        maximum: 90
+        unit: " s"
+    }
+
+    ResettableSlider {
         settingKey: "learn_rate_pct"
         label: settings.tr("Learning rate")
         description: settings.tr("How far each manual adjustment shifts the learned preference. Low values need several adjustments in the same direction before the curve follows your taste")
-        defaultValue: 30
+        defaultValue: 10
         minimum: 5
         maximum: 100
         unit: "%"
@@ -163,7 +173,7 @@ PluginSettings {
         settingKey: "lux_deadband_pct"
         label: settings.tr("Light deadband")
         description: settings.tr("Skip adjustments when the averaged light changed less than this share")
-        defaultValue: 10
+        defaultValue: 5
         minimum: 5
         maximum: 20
         unit: "%"
